@@ -844,3 +844,8 @@ table.data-table tr.row-highlight td {
     flex-wrap: wrap;
   }
 }
+/* 导入预览：单元格内换行（引号包裹的多行值）保留可见 */
+.data-table td.cell-newline {
+  white-space: pre-line;
+  vertical-align: top;
+}

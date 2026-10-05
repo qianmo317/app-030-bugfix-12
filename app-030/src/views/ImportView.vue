@@ -3,17 +3,20 @@ import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { flushProject, getProject, getRule, store } from '../logic/store'
 import {
-  EMPTY_MAPPING,
   IMPORT_FIELDS,
   IMPORT_TEMPLATE_HEADER,
   IMPORT_TEMPLATE_SAMPLE,
   applyImport,
   buildDryRun,
-  detectHeaderRow,
-  guessMapping,
+  createImportPlan,
   mappedCount,
+  missingRequiredFields,
+  statusesForMapping,
+  EMPTY_MAPPING,
   type ColumnMapping,
-  type DryRun
+  type ColumnStatus,
+  type DryRun,
+  type ImportPlan
 } from '../logic/importPlan'
 import { fnv1a, parseDelimitedText, readFileAsText, downloadText, toCsvText } from '../logic/csv'
 import { isXlsxFile, readXlsxRows } from '../logic/xlsx'
@@ -27,7 +30,7 @@ const fileName = ref('')
 const fileSize = ref(0)
 const fingerprint = ref('')
 const rawRows = ref<string[][]>([])
-const headerIndex = ref(-1)
+const plan = ref<ImportPlan | null>(null)
 const mapping = ref<ColumnMapping>({ ...EMPTY_MAPPING })
 const previewStale = ref(false)
 const dryRun = ref<DryRun | null>(null)
@@ -40,22 +43,33 @@ const showAll = ref(false)
 
 const RENDER_LIMIT = 200
 
-const dataRowCount = computed(() => {
-  if (headerIndex.value < 0) return 0
-  return Math.max(0, rawRows.value.length - headerIndex.value - 1)
-})
+const headerIndex = computed(() => plan.value?.headerIndex ?? -1)
 
-const requiredMissing = computed(() =>
-  IMPORT_FIELDS.filter((field) => field.required && mapping.value[field.key] === null).map((field) => field.label)
+const dataRowCount = computed(() => plan.value?.dataRows.length ?? 0)
+
+const requiredMissing = computed(() => missingRequiredFields(mapping.value))
+
+const headerCells = computed(() => plan.value?.header ?? [])
+
+/** 当前生效映射下每一列的状态（自动判定或手工改判共用同一套展示） */
+const columnStatuses = computed<ColumnStatus[]>(() =>
+  plan.value ? statusesForMapping(plan.value.header, mapping.value) : []
 )
 
-const headerCells = computed(() =>
-  headerIndex.value >= 0 ? rawRows.value[headerIndex.value] ?? [] : rawRows.value[0] ?? []
-)
+const unmatchedColumns = computed(() => columnStatuses.value.filter((status) => status.kind === 'unmatched'))
 
 const rawPreview = computed(() => {
-  if (headerIndex.value < 0) return []
-  return rawRows.value.slice(headerIndex.value, headerIndex.value + 6)
+  const current = plan.value
+  if (!current) return []
+  // 展示表头 + 其后最多 5 个数据行（空行已在 createImportPlan 中剔除）
+  return [current.header, ...current.dataRows.slice(0, 5).map((row) => row.cells)]
+})
+
+/** 与 rawPreview 一一对应的物理行号（表头行之后用数据行真实行号） */
+const rawPreviewLineNos = computed(() => {
+  const current = plan.value
+  if (!current) return []
+  return [current.headerIndex + 1, ...current.dataRows.slice(0, 5).map((row) => row.lineNo)]
 })
 
 const alreadyImported = computed(() => {
@@ -88,13 +102,17 @@ const hiddenCount = computed(() => {
   return showAll.value ? 0 : Math.max(0, filtered.length - RENDER_LIMIT)
 })
 
-watch(mapping, () => {
-  if (dryRun.value) previewStale.value = true
-})
+watch(
+  mapping,
+  () => {
+    if (dryRun.value) previewStale.value = true
+  },
+  { deep: true }
+)
 
 function resetAll(): void {
   rawRows.value = []
-  headerIndex.value = -1
+  plan.value = null
   mapping.value = { ...EMPTY_MAPPING }
   dryRun.value = null
   previewStale.value = false
@@ -124,19 +142,21 @@ async function handleFile(file: File): Promise<void> {
       rows = parseDelimitedText(text)
       contentKey = text
     }
-    if (rows.length === 0) {
+    if (rows.length === 0 || rows.every((row) => row.every((cell) => cell.trim() === ''))) {
       fileError.value = '文件里没有可识别的数据行'
       return
     }
     rawRows.value = rows
     fingerprint.value = `${file.name}|${file.size}|${fnv1a(contentKey)}`
-    const detected = detectHeaderRow(rows)
-    if (detected < 0) {
-      fileError.value = '未能识别表头行（前 8 行未找到姓名/性别/身高/胸围/腰围等列名），请检查文件或改用导入模板'
+    // 表头位置 / 列映射 / 数据行集合的唯一判定入口；重选同一文件结果一致
+    const imported = createImportPlan(rows)
+    if (!imported) {
+      fileError.value =
+        '未能识别表头行（前 10 行未找到至少 2 个字段、且其中含必填列 姓名/性别/身高/胸围/腰围），请检查表头前是否有标题或空行，或改用导入模板'
       return
     }
-    headerIndex.value = detected
-    mapping.value = guessMapping(rows[detected])
+    plan.value = imported
+    mapping.value = { ...imported.mapping }
     parseMs.value = Math.round((performance.now() - started) * 100) / 100
   } catch (error) {
     fileError.value = error instanceof Error ? error.message : String(error)
@@ -158,8 +178,8 @@ function onDrop(event: DragEvent): void {
 function buildPreview(): void {
   resultText.value = ''
   fileError.value = ''
-  if (!project.value) return
-  if (headerIndex.value < 0) {
+  const currentPlan = plan.value
+  if (!currentPlan || !project.value) {
     fileError.value = '请先选择文件'
     return
   }
@@ -168,11 +188,10 @@ function buildPreview(): void {
     return
   }
   const started = performance.now()
-  const rows = rawRows.value
-    .slice(headerIndex.value + 1)
-    .map((cells, index) => ({ cells, lineNo: headerIndex.value + index + 2 }))
-    .filter((row) => row.cells.some((cell) => cell !== ''))
-  dryRun.value = buildDryRun(rows, mapping.value, project.value, rule.value, fileName.value, fingerprint.value)
+  // 数据行与行号来自 createImportPlan 的唯一结果；映射若被手工调整则随预览一起固化，
+  // 正式导入直接消费这份 dryRun，不再重新判定
+  const effectiveMapping = mapping.value
+  dryRun.value = buildDryRun(currentPlan, project.value, rule.value, fileName.value, fingerprint.value, effectiveMapping)
   parseMs.value = Math.round((performance.now() - started) * 100) / 100
   previewStale.value = false
   showAll.value = false
@@ -182,6 +201,10 @@ async function confirmImport(): Promise<void> {
   const current = project.value
   const preview = dryRun.value
   if (!current || !preview) return
+  if (previewStale.value) {
+    fileError.value = '列映射在上次预览后被修改，请先重新生成 dry_run 预览，再正式导入（预览与导入必须使用同一套判定）'
+    return
+  }
   if (alreadyImported.value) {
     fileError.value = '该文件指纹已导入过，为避免重复写入已阻止（同一文件幂等）'
     return
@@ -296,6 +319,18 @@ function formatSize(bytes: number): string {
             </label>
           </div>
 
+          <div v-if="plan && plan.warnings.length" style="margin-top: 10px">
+            <p v-for="(warning, index) in plan.warnings" :key="index" class="notice notice-warn" style="margin: 6px 0">
+              {{ warning }}
+            </p>
+          </div>
+          <p v-if="unmatchedColumns.length" class="hint" style="margin-top: 8px">
+            另有 {{ unmatchedColumns.length }} 列未对上字段（不导入，可在上方下拉手工指定）：
+            <template v-for="(status, index) in unmatchedColumns" :key="status.index">
+              <span v-if="index > 0">、</span>第{{ status.index + 1 }}列「{{ status.header || '空列名' }}」
+            </template>
+          </p>
+
           <div class="table-wrap" style="margin-top: 12px">
             <table class="data-table">
               <thead>
@@ -306,8 +341,10 @@ function formatSize(bytes: number): string {
               </thead>
               <tbody>
                 <tr v-for="(row, rowIndex) in rawPreview" :key="rowIndex">
-                  <td>{{ headerIndex + rowIndex + 1 }}</td>
-                  <td v-for="(cell, cellIndex) in row" :key="cellIndex">{{ cell }}</td>
+                  <td>{{ rawPreviewLineNos[rowIndex] }}</td>
+                  <td v-for="(cell, cellIndex) in row" :key="cellIndex" :class="{ 'cell-newline': cell.includes('\n') }">
+                    {{ cell }}
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -316,7 +353,7 @@ function formatSize(bytes: number): string {
           <div class="toolbar" style="margin-top: 12px">
             <button class="btn btn-primary" type="button" @click="buildPreview">确认映射并生成 dry_run 预览</button>
             <span v-if="requiredMissing.length" class="hint">必填列未映射：{{ requiredMissing.join('、') }}</span>
-            <span v-else-if="previewStale" class="hint">列映射已修改，请重新生成预览</span>
+            <span v-else-if="previewStale" class="hint">列映射已修改，请重新生成预览后再导入</span>
           </div>
         </div>
       </div>
@@ -361,7 +398,12 @@ function formatSize(bytes: number): string {
               <option value="duplicate">仅可能重复</option>
             </select>
           </label>
-          <button class="btn btn-primary" type="button" :disabled="alreadyImported || importableCount === 0" @click="confirmImport">
+          <button
+            class="btn btn-primary"
+            type="button"
+            :disabled="alreadyImported || previewStale || importableCount === 0"
+            @click="confirmImport"
+          >
             确认导入（{{ importableCount }} 条）
           </button>
           <span v-if="hiddenCount" class="hint">为保持流畅仅显示前 {{ RENDER_LIMIT }} 行</span>
