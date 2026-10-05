@@ -28,7 +28,7 @@ export type ImportField = {
 export const IMPORT_FIELDS: ImportField[] = [
   { key: 'name', label: '姓名', required: true, patterns: [/姓名/, /名字/, /^name$/i, /学生/, /员工/] },
   { key: 'gender', label: '性别', required: true, patterns: [/性别/, /^sex$/i, /^gender$/i] },
-  { key: 'orgUnit', label: '班级/车间', required: false, patterns: [/班级/, /车间/, /部门/, /单位/, /^org/i, /班组/, /科室/] },
+  { key: 'orgUnit', label: '班级/车间', required: false, patterns: [/班级/, /车间/, /部门/, /单位/, /^org/i, /^class/i, /^dept/i, /^department/i, /班组/, /科室/] },
   { key: 'batch', label: '批次', required: false, patterns: [/批次/, /^batch$/i, /季节/] },
   { key: 'heightCm', label: '身高(cm)', required: true, patterns: [/身高/, /^height/i, /^h$/i] },
   { key: 'weightKg', label: '体重(kg)', required: false, patterns: [/体重/, /^weight/i] },
@@ -57,11 +57,40 @@ function normalizeHeader(text: string): string {
   return text.replace(/[\s（）()：:_\-/]/g, '').toLowerCase()
 }
 
+function findColumn(normalized: string[], claimed: Set<number>, test: (cell: string) => boolean): number {
+  for (let index = 0; index < normalized.length; index += 1) {
+    if (claimed.has(index) || normalized[index] === '') continue
+    if (test(normalized[index])) return index
+  }
+  return -1
+}
+
+/**
+ * 列映射规则（导入预览与正式导入共用这一份结果，不各算一遍）：
+ * 1. 与字段标签完全一致的列优先认领；
+ * 2. 剩余字段按 IMPORT_FIELDS 顺序用模糊模式（中文短名 / 英文写法都认）认领最左的空闲列；
+ * 3. 一列只对应一个字段；两列都能对上一个字段、或同名字列出现两次时，只取最左一列，
+ *    其余列保持未映射（导入时忽略，不影响人数）。
+ */
 export function guessMapping(header: string[]): ColumnMapping {
   const mapping: ColumnMapping = { ...EMPTY_MAPPING }
+  const normalized = header.map((cell) => normalizeHeader(cell))
+  const claimed = new Set<number>()
   for (const field of IMPORT_FIELDS) {
-    const index = header.findIndex((cell) => normalizeHeader(cell) === normalizeHeader(field.label))
-    mapping[field.key] = index >= 0 ? index : null
+    const label = normalizeHeader(field.label)
+    const index = findColumn(normalized, claimed, (cell) => cell === label)
+    if (index >= 0) {
+      mapping[field.key] = index
+      claimed.add(index)
+    }
+  }
+  for (const field of IMPORT_FIELDS) {
+    if (mapping[field.key] !== null) continue
+    const index = findColumn(normalized, claimed, (cell) => field.patterns.some((pattern) => pattern.test(cell)))
+    if (index >= 0) {
+      mapping[field.key] = index
+      claimed.add(index)
+    }
   }
   return mapping
 }
@@ -70,9 +99,22 @@ export function mappedCount(mapping: ColumnMapping): number {
   return IMPORT_FIELDS.filter((field) => mapping[field.key] !== null).length
 }
 
-/** 表头行识别：前 8 行内命中字段最多的那一行 */
+export const HEADER_SCAN_LIMIT = 8
+export const HEADER_MIN_MATCHED_FIELDS = 2
+
+/** 表头行识别：前 8 行内命中字段最多（且至少 2 个）的那一行；标题行/空行在前不会误判，数据行也不会被当成表头 */
 export function detectHeaderRow(rows: string[][]): number {
-  return rows.length > 0 && mappedCount(guessMapping(rows[0])) > 0 ? 0 : -1
+  let bestIndex = -1
+  let bestScore = 0
+  const limit = Math.min(rows.length, HEADER_SCAN_LIMIT)
+  for (let index = 0; index < limit; index += 1) {
+    const score = mappedCount(guessMapping(rows[index]))
+    if (score > bestScore) {
+      bestScore = score
+      bestIndex = index
+    }
+  }
+  return bestScore >= HEADER_MIN_MATCHED_FIELDS ? bestIndex : -1
 }
 
 export type DryRunKind = 'new' | 'update' | 'invalid' | 'error'

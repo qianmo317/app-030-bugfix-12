@@ -15,7 +15,7 @@ import {
   type ColumnMapping,
   type DryRun
 } from '../logic/importPlan'
-import { fnv1a, parseDelimitedText, readFileAsText, downloadText, toCsvText } from '../logic/csv'
+import { fnv1a, isBlankRow, parseDelimitedText, readFileAsText, downloadText, toCsvText } from '../logic/csv'
 import { isXlsxFile, readXlsxRows } from '../logic/xlsx'
 
 const route = useRoute()
@@ -88,9 +88,13 @@ const hiddenCount = computed(() => {
   return showAll.value ? 0 : Math.max(0, filtered.length - RENDER_LIMIT)
 })
 
-watch(mapping, () => {
-  if (dryRun.value) previewStale.value = true
-})
+watch(
+  mapping,
+  () => {
+    if (dryRun.value) previewStale.value = true
+  },
+  { deep: true }
+)
 
 function resetAll(): void {
   rawRows.value = []
@@ -124,6 +128,7 @@ async function handleFile(file: File): Promise<void> {
       rows = parseDelimitedText(text)
       contentKey = text
     }
+    rows = rows.filter((row) => !isBlankRow(row))
     if (rows.length === 0) {
       fileError.value = '文件里没有可识别的数据行'
       return
@@ -171,8 +176,9 @@ function buildPreview(): void {
   const rows = rawRows.value
     .slice(headerIndex.value + 1)
     .map((cells, index) => ({ cells, lineNo: headerIndex.value + index + 2 }))
-    .filter((row) => row.cells.some((cell) => cell !== ''))
-  dryRun.value = buildDryRun(rows, mapping.value, project.value, rule.value, fileName.value, fingerprint.value)
+    .filter((row) => !isBlankRow(row.cells))
+  // 映射快照：dry_run 生成后即使再改映射，预览与正式导入也始终按同一份映射判断
+  dryRun.value = buildDryRun(rows, { ...mapping.value }, project.value, rule.value, fileName.value, fingerprint.value)
   parseMs.value = Math.round((performance.now() - started) * 100) / 100
   previewStale.value = false
   showAll.value = false
@@ -182,6 +188,10 @@ async function confirmImport(): Promise<void> {
   const current = project.value
   const preview = dryRun.value
   if (!current || !preview) return
+  if (previewStale.value) {
+    fileError.value = '列映射已修改，预览已过期：请重新生成 dry_run 预览后再导入（预览与正式导入必须按同一份映射）'
+    return
+  }
   if (alreadyImported.value) {
     fileError.value = '该文件指纹已导入过，为避免重复写入已阻止（同一文件幂等）'
     return
@@ -281,6 +291,9 @@ function formatSize(bytes: number): string {
           </div>
 
           <h4 style="margin-top: 12px">列映射（请确认后生成预览）</h4>
+          <p class="hint" style="margin-top: 4px">
+            列名按中文短名（身高 / 班级）或英文写法（height / class）都能识别；同名字列只取最左一列，其余列自动忽略，一列只对应一个字段；预览与正式导入始终按同一份映射执行。
+          </p>
           <div class="form-grid">
             <label v-for="field in IMPORT_FIELDS" :key="field.key" class="field">
               <span class="field-label">
@@ -361,9 +374,10 @@ function formatSize(bytes: number): string {
               <option value="duplicate">仅可能重复</option>
             </select>
           </label>
-          <button class="btn btn-primary" type="button" :disabled="alreadyImported || importableCount === 0" @click="confirmImport">
+          <button class="btn btn-primary" type="button" :disabled="alreadyImported || importableCount === 0 || previewStale" @click="confirmImport">
             确认导入（{{ importableCount }} 条）
           </button>
+          <span v-if="previewStale" class="hint">列映射已修改，请重新生成预览后再导入</span>
           <span v-if="hiddenCount" class="hint">为保持流畅仅显示前 {{ RENDER_LIMIT }} 行</span>
           <button v-if="hiddenCount" class="btn btn-sm" type="button" @click="showAll = true">显示全部 {{ dryRun.rows.length }} 行</button>
           <div class="spacer"></div>
